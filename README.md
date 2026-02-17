@@ -1,4 +1,8 @@
-# React + Vite
+# device_onboarding
+
+This is a frontend repository created for internal ops. Not exposed to clients. Use to run a dashboard page for device registration data.
+
+## React + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
