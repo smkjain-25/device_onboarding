@@ -28,6 +28,11 @@ const formatNumber = (num) => {
   return num.toLocaleString();
 };
 
+// Simple Shimmer Component
+const Shimmer = ({ width = '100%', height = '2rem' }) => (
+  <div className="shimmer" style={{ width, height, borderRadius: '0.25rem' }}></div>
+);
+
 function Dashboard() {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -42,12 +47,6 @@ function Dashboard() {
   const [selectedOrgType, setSelectedOrgType] = useState('');
   const [selectedOrgList, setSelectedOrgList] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
-
-  // Lock Device Modal State
-  const [showLockModal, setShowLockModal] = useState(false);
-  const [lockSerialNumber, setLockSerialNumber] = useState('');
-  const [lockAction, setLockAction] = useState('lock'); // 'lock' or 'unlock'
-  const [lockStatusMessage, setLockStatusMessage] = useState({ type: '', text: '' });
 
   const [codesGeneratedToday, setCodesGeneratedToday] = useState(0);
 
@@ -82,60 +81,77 @@ function Dashboard() {
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
+      setActiveDevicesLoading(true);
+
       try {
-        // 1. Fetch main IFP details from QA
-        const response = await fetch('https://app.teachmint.qa/institute-ifps/all/ifps/details');
-        if (!response.ok) {
-          throw new Error('Network response was not ok');
-        }
-        const result = await response.json();
+        // 1. Fetch IFP details and Active Devices in parallel
+        const [ifpResponse, activeResponse] = await Promise.all([
+          fetch('https://app.teachmint.qa/institute-ifps/all/ifps/details'),
+          fetch('https://app.teachmint.qa/institute-ifps/active-devices-pincode-wise')
+        ]);
 
+        if (!ifpResponse.ok) throw new Error('IFP API failed');
+        if (!activeResponse.ok) console.warn('Active devices API failed');
+
+        const ifpResult = await ifpResponse.json();
+        const activeResult = activeResponse.ok ? await activeResponse.json() : { obj: {} };
+
+        // Process IFP Data
         let rawData = [];
-        if (result && result.obj) {
-          if (Array.isArray(result.obj.data)) {
-            rawData = result.obj.data;
-            setCodesGeneratedToday(result.obj.codes_generated_today || 0);
-          } else if (Array.isArray(result.obj)) {
-            rawData = result.obj;
+        if (ifpResult && ifpResult.obj) {
+          if (Array.isArray(ifpResult.obj.data)) {
+            rawData = ifpResult.obj.data;
+            setCodesGeneratedToday(ifpResult.obj.codes_generated_today || 0);
+          } else if (Array.isArray(ifpResult.obj)) {
+            rawData = ifpResult.obj;
           }
-        } else {
-          throw new Error('Unexpected API response structure');
         }
 
-        // 2. Extract unique institute IDs for batch fetch
-        const instituteIds = [...new Set(rawData
-          .map(item => item.institute_id)
-          .filter(id => id) // remove null/undefined
-        )];
+        // Filter out TEST devices (serial number contains "test" case-insensitive)
+        rawData = rawData.filter(item => {
+          const serial = item.device_serial_no;
+          if (serial && typeof serial === 'string') {
+            return !serial.toLowerCase().includes('test');
+          }
+          return true;
+        });
 
-        // 3. Fetch institute details from QA
+        // Process Active Devices Data
+        let activeDevicesMap = {};
+        if (activeResult && activeResult.status && activeResult.obj) {
+          activeDevicesMap = activeResult.obj;
+        }
+        console.log('ACTIVE DEVICES API:', activeDevicesMap);
+
+        // 2. Extract unique institute IDs from BOTH sources
+        const ifpInstituteIds = rawData.map(item => item.institute_id).filter(id => id);
+        const activeInstituteIds = Object.keys(activeDevicesMap);
+        const allInstituteIds = [...new Set([...ifpInstituteIds, ...activeInstituteIds])];
+
+        // 3. Fetch institute details (SINGLE BATCH CALL)
         let instituteMap = {};
-
-        if (instituteIds.length > 0) {
+        if (allInstituteIds.length > 0) {
           try {
             const batchResponse = await fetch('https://app.teachmint.qa/institute-ifps/institute/details/batch', {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({ institute_ids: instituteIds })
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ institute_ids: allInstituteIds })
             });
 
             if (batchResponse.ok) {
               const batchResult = await batchResponse.json();
-              // The API returns an object keyed by ID: { "ID1": { ... }, "ID2": { ... } }
               if (batchResult && batchResult.obj) {
                 instituteMap = batchResult.obj;
               }
             } else {
-              console.warn('Batch institute fetch failed:', batchResponse.status);
+              console.warn('Batch institute fetch failed');
             }
-          } catch (batchErr) {
-            console.warn('Batch institute fetch error:', batchErr);
+          } catch (e) {
+            console.warn('Batch fetch error:', e);
           }
         }
 
-        // Helper for normalization
+        // Helper
         const normalizeTitleCase = (str) => {
           if (!str) return '';
           const upper = str.toUpperCase();
@@ -143,140 +159,81 @@ function Dashboard() {
           if (upper === 'USA' || upper === 'US' || upper === 'UNITED STATES OF AMERICA') return 'United States';
           if (upper === 'UK' || upper === 'UNITED KINGDOM') return 'United Kingdom';
           if (upper === 'UAE') return 'United Arab Emirates';
-
-          return str.trim().split(/\s+/)
-            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-            .join(' ');
+          return str.trim().split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         };
 
-        console.log('API FETCHED: rawData sample:', rawData.slice(0, 2));
-        console.log('INSTITUTE MAP keys sample:', Object.keys(instituteMap).slice(0, 5));
-
-        // 4. Merge location data (pincode, country) into main data
+        // 4. Merge Data for Dashboard Metrics/Geo Map
         const mergedData = rawData.map(item => {
-          // Robust ID lookup (trimming just in case)
           const instId = item.institute_id?.toString().trim();
           const instDetails = instituteMap[instId];
-
           if (instDetails) {
             const address = item.institute_address || {};
-
             let rawCountry = instDetails.country || address.country;
             let pincode = instDetails.pincode || address.pincode;
 
-            // Heuristic for India
             if ((!rawCountry || rawCountry.toLowerCase() === 'unknown' || rawCountry.toLowerCase() === 'null') &&
               pincode && pincode.toString().length === 6) {
               rawCountry = 'India';
             }
-
             const country = normalizeTitleCase(rawCountry);
 
             return {
               ...item,
               institute_name: instDetails.name || item.institute_name,
-              institute_address: {
-                ...address,
-                pincode: pincode,
-                country: country
-              },
-              pincode: pincode,
-              country: country,
-              institute_type: instDetails.institution_type || instDetails.institute_type || item.institute_type // Merge type
+              institute_address: { ...address, pincode, country },
+              pincode,
+              country,
+              institute_type: instDetails.institution_type || instDetails.institute_type || item.institute_type
             };
           }
           return item;
         });
 
-        console.log(`MERGE SUMMARY: Total: ${mergedData.length}. Items with country: ${mergedData.filter(d => d.country).length}`);
-        if (mergedData.length > 0) console.log('Merged Item sample:', mergedData.find(d => d.country) || mergedData[0]);
+        // 5. Create Active Devices Pincode Map
+        const pincodeDeviceMap = {};
+        console.log('Processing Active Devices Map keys:', Object.keys(activeDevicesMap));
+
+        Object.entries(activeDevicesMap).forEach(([key, deviceCount]) => {
+          const cleanKey = key.toString().trim(); // Normalize key
+
+          // Check if key is a 6-digit pincode
+          if (/^\d{6}$/.test(cleanKey)) {
+            pincodeDeviceMap[cleanKey] = (pincodeDeviceMap[cleanKey] || 0) + deviceCount;
+          } else {
+            // Fallback to existing logic (lookup by institute ID)
+            // Try direct lookup first
+            let instDetails = instituteMap[cleanKey];
+
+            // If not found, try looking up case-insensitive/trimmed in instituteMap keys
+            if (!instDetails) {
+              const foundKey = Object.keys(instituteMap).find(k => k.toString().trim() === cleanKey);
+              if (foundKey) instDetails = instituteMap[foundKey];
+            }
+
+            if (instDetails && instDetails.pincode) {
+              const pincode = instDetails.pincode.toString();
+              pincodeDeviceMap[pincode] = (pincodeDeviceMap[pincode] || 0) + deviceCount;
+            } else {
+              console.warn(`Institute details not found for key: "${cleanKey}" (original: "${key}")`);
+            }
+          }
+        });
 
         setData(mergedData);
+        setActiveDevicesData(pincodeDeviceMap);
         setError(null);
 
       } catch (err) {
-        console.error('API fetch failed:', err);
-        setError('Failed to fetch from API. Showing mock data for demonstration.');
-
-        // Mock data fallback
-        const now = Date.now() / 1000;
-        const adjustedMock = mockData.map((item, index) => ({
-          ...item,
-          c: now - (index * 3600),
-          u: now - (index * 1800),
-        }));
-        setData(adjustedMock);
+        console.error('API Chain Failed:', err);
+        setError('Failed to fetch data');
+        // Fallback or error handling
       } finally {
         setLoading(false);
-      }
-    };
-
-    fetchData();
-  }, []);
-
-  // Fetch active devices data for the second map
-  useEffect(() => {
-    const fetchActiveDevices = async () => {
-      setActiveDevicesLoading(true);
-      try {
-        // 1. Fetch active devices by institute_id
-        const response = await fetch('https://app.teachmint.qa/institute-ifps/active-devices-pincode-wise');
-        if (!response.ok) {
-          throw new Error('Active devices API failed');
-        }
-        const result = await response.json();
-
-        // Response format: {"status": true, "obj": {"TEC563": 3, "EDU793": 1}}
-        let activeDevicesMap = {};
-        if (result && result.status && result.obj) {
-          activeDevicesMap = result.obj;
-        }
-
-        console.log('ACTIVE DEVICES API:', activeDevicesMap);
-
-        // 2. Get institute IDs and fetch their details for pincode mapping
-        const instituteIds = Object.keys(activeDevicesMap);
-
-        if (instituteIds.length > 0) {
-          try {
-            const batchResponse = await fetch('https://app.teachmint.qa/institute-ifps/institute/details/batch', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({ institute_ids: instituteIds })
-            });
-
-            if (batchResponse.ok) {
-              const batchResult = await batchResponse.json();
-              const instituteMap = batchResult?.obj || {};
-
-              // 3. Create pincode -> device count mapping
-              const pincodeDeviceMap = {};
-
-              Object.entries(activeDevicesMap).forEach(([instituteId, deviceCount]) => {
-                const instDetails = instituteMap[instituteId];
-                if (instDetails && instDetails.pincode) {
-                  const pincode = instDetails.pincode.toString();
-                  pincodeDeviceMap[pincode] = (pincodeDeviceMap[pincode] || 0) + deviceCount;
-                }
-              });
-
-              console.log('ACTIVE DEVICES BY PINCODE:', pincodeDeviceMap);
-              setActiveDevicesData(pincodeDeviceMap);
-            }
-          } catch (batchErr) {
-            console.warn('Batch fetch for active devices failed:', batchErr);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to fetch active devices:', err);
-      } finally {
         setActiveDevicesLoading(false);
       }
     };
 
-    fetchActiveDevices();
+    fetchData();
   }, []);
 
   // Fetch linking/delinking stats
@@ -308,11 +265,11 @@ function Dashboard() {
 
   // Helper to check if timestamp (in seconds) is within range
   const isWithinRange = (timestamp) => {
-    if (!timestamp) return true; // Be permissive if no timestamp
+    if (!timestamp) return false; // STRICT: Must have a timestamp
 
     // Handle both seconds and milliseconds
     let ts = Number(timestamp);
-    if (isNaN(ts)) return true; // Be permissive if timestamp is invalid string
+    if (isNaN(ts)) return false; // STRICT: Must be a valid number
     if (ts > 10000000000) ts = ts / 1000; // Likely ms, convert to s
 
     const date = new Date(ts * 1000);
@@ -324,7 +281,8 @@ function Dashboard() {
 
   const totalRegistered = useMemo(() => {
     // Show everything by default unless deleted is specifically true
-    return data.filter(item => item.deleted !== true);
+    // AND strictly check for onboarding_setup as per user requirement
+    return data.filter(item => item.deleted !== true && item.onboarding_setup === true);
   }, [data]);
 
   const filteredRegistered = useMemo(() => {
@@ -377,8 +335,12 @@ function Dashboard() {
 
   const lockedMetrics = useMemo(() => {
     const filtered = data.filter(item => {
-      if (!item.is_locked) return false;
-      if (item.deleted) return false;
+      // Strict user requirement: is_locked: true (handle boolean or string)
+      const isLocked = item.is_locked === true || item.is_locked === 'true';
+      if (!isLocked) return false;
+
+      // Strict user requirement: locked_at in date range
+      // Device MUST have a locked_at timestamp
       return isWithinRange(item.locked_at);
     });
     return new Set(filtered.map(item => item.unique_device_id || item._id)).size;
@@ -465,74 +427,7 @@ function Dashboard() {
     setEndDate(date);
   };
 
-  const handleDeviceLock = async () => {
-    if (!lockSerialNumber) return;
 
-    setLockStatusMessage({ type: '', text: '' });
-
-    try {
-      const isLocking = lockAction === 'lock';
-      const payload = {
-        serialNumber: lockSerialNumber,
-        lock: isLocking
-      };
-
-      const response = await fetch('https://app.teachmint.qa/institute-ifps/lock-unlock-device', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      const result = await response.json();
-
-      // Check for both HTTP success and API-level success (status: true)
-      // Some APIs might return 200 OK but with { status: false, message: "..." }
-      if (response.ok && (result.status === true || result.status === undefined) && !result.error) {
-        // Update local state to reflect change immediately
-        const updatedData = data.map(item => {
-          // Check both serial_number and unique_device_id just in case
-          if (item.serial_number === lockSerialNumber || item.unique_device_id === lockSerialNumber) {
-            return { ...item, is_locked: isLocking, locked_at: isLocking ? Date.now() / 1000 : null };
-          }
-          return item;
-        });
-
-        setData(updatedData);
-        // Don't close modal immediately, show success message
-        setLockStatusMessage({
-          type: 'success',
-          text: `Success: Device ${lockSerialNumber} has been ${isLocking ? 'LOCKED' : 'UNLOCKED'}.`
-        });
-        setLockSerialNumber('');
-      } else {
-        console.error('Lock API Error:', result);
-        // Extract error message from various possible fields
-        const errorMessage = result.message || result.error || (result.obj && result.obj.message) || `Failed to ${lockAction} device.`;
-        setLockStatusMessage({
-          type: 'error',
-          text: errorMessage
-        });
-      }
-
-    } catch (error) {
-      console.error('Lock Action Failed:', error);
-      setLockStatusMessage({
-        type: 'error',
-        text: 'Network request failed. Please try again.'
-      });
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="loader-container">
-        <div className="spinner"></div>
-        <p>Loading Dashboard...</p>
-      </div>
-    );
-  }
 
   return (
     <div className="container">
@@ -586,21 +481,25 @@ function Dashboard() {
             <span>Devices Registered</span>
             <Monitor size={20} />
           </div>
-          <div className="card-value">{formatNumber(metrics.registered)}</div>
+          {loading ? (
+            <Shimmer width="60%" height="2.5rem" />
+          ) : (
+            <div className="card-value">{formatNumber(metrics.registered)}</div>
+          )}
           <div className="card-subtext">Active (Deleted: False)</div>
 
           <div className="source-breakdown">
             <div className="source-item">
               <span>IFP</span>
-              <span className="badge badge-ifp">{formatNumber(metrics.bySource.ifp)}</span>
+              {loading ? <Shimmer width="40px" height="1.5rem" /> : <span className="badge badge-ifp">{formatNumber(metrics.bySource.ifp)}</span>}
             </div>
             <div className="source-item">
               <span>Web</span>
-              <span className="badge badge-web">{formatNumber(metrics.bySource.web)}</span>
+              {loading ? <Shimmer width="40px" height="1.5rem" /> : <span className="badge badge-web">{formatNumber(metrics.bySource.web)}</span>}
             </div>
             <div className="source-item">
               <span>Mobile</span>
-              <span className="badge badge-mobile">{formatNumber(metrics.bySource.mobile)}</span>
+              {loading ? <Shimmer width="40px" height="1.5rem" /> : <span className="badge badge-mobile">{formatNumber(metrics.bySource.mobile)}</span>}
             </div>
           </div>
         </div>
@@ -622,22 +521,28 @@ function Dashboard() {
               <div key={type.key} className="source-item" style={{ fontSize: '1rem' }}>
                 <span>{type.label}</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <span className="badge" style={{ background: type.bg, color: type.color, fontSize: '0.9rem' }}>
-                    {formatNumber(metrics.orgTypes.counts[type.key])}
-                  </span>
-                  <button
-                    className="icon-button"
-                    onClick={() => {
-                      setSelectedOrgType(type.label);
-                      setSelectedOrgList(metrics.orgTypes.lists[type.key]);
-                      setSearchTerm(''); // Reset search
-                      setShowOrgModal(true);
-                    }}
-                    title="View Institute List"
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, display: 'flex' }}
-                  >
-                    <Eye size={16} color="var(--text-secondary)" />
-                  </button>
+                  {loading ? (
+                    <Shimmer width="40px" height="1.5rem" />
+                  ) : (
+                    <>
+                      <span className="badge" style={{ background: type.bg, color: type.color, fontSize: '0.9rem' }}>
+                        {formatNumber(metrics.orgTypes.counts[type.key])}
+                      </span>
+                      <button
+                        className="icon-button"
+                        onClick={() => {
+                          setSelectedOrgType(type.label);
+                          setSelectedOrgList(metrics.orgTypes.lists[type.key]);
+                          setSearchTerm(''); // Reset search
+                          setShowOrgModal(true);
+                        }}
+                        title="View Institute List"
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, display: 'flex' }}
+                      >
+                        <Eye size={16} color="var(--text-secondary)" />
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
@@ -680,7 +585,11 @@ function Dashboard() {
             <span>Institutes Onboarded</span>
             <Monitor size={20} />
           </div>
-          <div className="card-value">{formatNumber(metrics.uniqueInstitutes)}</div>
+          {loading ? (
+            <Shimmer width="60%" height="2.5rem" />
+          ) : (
+            <div className="card-value">{formatNumber(metrics.uniqueInstitutes)}</div>
+          )}
           <div className="card-subtext">Unique Institutes (≥1 Device)</div>
           <button
             onClick={() => setShowModal(true)}
@@ -717,24 +626,12 @@ function Dashboard() {
               }} />
             </div>
           </div>
-          <div className="card-value">{formatNumber(metrics.locked)}</div>
+          {loading ? (
+            <Shimmer width="60%" height="2.5rem" />
+          ) : (
+            <div className="card-value">{formatNumber(metrics.locked)}</div>
+          )}
           <div className="card-subtext">Locked & Recently Active</div>
-          <button
-            onClick={() => setShowLockModal(true)}
-            style={{
-              marginTop: '1rem',
-              padding: '0.5rem 1rem',
-              background: 'rgba(239, 68, 68, 0.1)',
-              color: '#f87171',
-              border: '1px solid rgba(239, 68, 68, 0.2)',
-              borderRadius: '0.375rem',
-              cursor: 'pointer',
-              fontSize: '0.75rem',
-              width: '100%'
-            }}
-          >
-            Manage Device Lock
-          </button>
         </div>
 
         {/* Training Tickets */}
@@ -743,12 +640,16 @@ function Dashboard() {
             <span>Training Tickets</span>
             <LifeBuoy size={20} />
           </div>
-          <div className="card-value">{formatNumber(metrics.trainingTickets)}</div>
+          {loading ? (
+            <Shimmer width="60%" height="2.5rem" />
+          ) : (
+            <div className="card-value">{formatNumber(metrics.trainingTickets)}</div>
+          )}
           <div className="card-subtext">Zoho Tickets for Training</div>
         </div>
       </div>
 
-      <GeoDistribution data={totalRegistered} />
+      <GeoDistribution data={totalRegistered} loading={loading} />
       <ActiveDevicesMap activeDevicesData={activeDevicesData} loading={activeDevicesLoading} />
 
       {/* Modal for High Volume Institutes */}
@@ -912,149 +813,6 @@ function Dashboard() {
                     ));
                   })()
                 }
-              </div>
-            </div>
-          </div>
-        )
-      }
-
-      {/* Modal for Device Lock Management */}
-      {
-        showLockModal && (
-          <div style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0,0,0,0.7)',
-            display: 'flex',
-            justifyContent: 'center',
-            alignItems: 'center',
-            zIndex: 60
-          }}>
-            <div style={{
-              background: '#1e293b',
-              padding: '2rem',
-              borderRadius: '1rem',
-              border: '1px solid #334155',
-              maxWidth: '450px',
-              width: '90%',
-              display: 'flex',
-              flexDirection: 'column'
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1.5rem', alignItems: 'center' }}>
-                <h3 style={{ fontSize: '1.25rem', fontWeight: 700, margin: 0, whiteSpace: 'nowrap' }}>Manage Device Lock</h3>
-                <button
-                  onClick={() => {
-                    setShowLockModal(false);
-                    setLockStatusMessage({ type: '', text: '' }); // Reset on close
-                  }}
-                  style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', display: 'flex', flexShrink: 0 }}
-                >
-                  <X size={24} />
-                </button>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-                {/* Serial Number Input */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Serial Number / Device ID</label>
-                  <input
-                    type="text"
-                    value={lockSerialNumber}
-                    onChange={(e) => setLockSerialNumber(e.target.value)}
-                    placeholder="Enter Device Serial Number"
-                    style={{
-                      padding: '0.75rem',
-                      background: '#0f172a',
-                      border: '1px solid #334155',
-                      borderRadius: '0.5rem',
-                      color: 'white',
-                      fontSize: '1rem'
-                    }}
-                  />
-                </div>
-
-                {/* Action Selection */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Action</label>
-                  <div style={{ display: 'flex', gap: '1rem' }}>
-                    <div
-                      onClick={() => setLockAction('lock')}
-                      style={{
-                        flex: 1,
-                        padding: '1rem',
-                        borderRadius: '0.5rem',
-                        border: `1px solid ${lockAction === 'lock' ? '#ef4444' : '#334155'}`,
-                        background: lockAction === 'lock' ? 'rgba(239, 68, 68, 0.1)' : '#0f172a',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        gap: '0.5rem',
-                        color: lockAction === 'lock' ? '#f87171' : '#94a3b8',
-                        transition: 'all 0.2s'
-                      }}
-                    >
-                      <Lock size={18} />
-                      <span style={{ fontWeight: 500 }}>Lock Device</span>
-                    </div>
-                    <div
-                      onClick={() => setLockAction('unlock')}
-                      style={{
-                        flex: 1,
-                        padding: '1rem',
-                        borderRadius: '0.5rem',
-                        border: `1px solid ${lockAction === 'unlock' ? '#10b981' : '#334155'}`,
-                        background: lockAction === 'unlock' ? 'rgba(16, 185, 129, 0.1)' : '#0f172a',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        gap: '0.5rem',
-                        color: lockAction === 'unlock' ? '#34d399' : '#94a3b8',
-                        transition: 'all 0.2s'
-                      }}
-                    >
-                      <Unlock size={18} />
-                      <span style={{ fontWeight: 500 }}>Unlock Device</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Status Message */}
-                {lockStatusMessage.text && (
-                  <div style={{
-                    padding: '0.75rem',
-                    borderRadius: '0.5rem',
-                    fontSize: '0.875rem',
-                    background: lockStatusMessage.type === 'success' ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                    color: lockStatusMessage.type === 'success' ? '#34d399' : '#f87171',
-                    border: `1px solid ${lockStatusMessage.type === 'success' ? '#059669' : '#b91c1c'}`
-                  }}>
-                    {lockStatusMessage.text}
-                  </div>
-                )}
-
-                {/* Submit Button */}
-                <button
-                  onClick={handleDeviceLock}
-                  style={{
-                    padding: '0.875rem',
-                    background: '#3b82f6',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '0.5rem',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    marginTop: '0.5rem',
-                    opacity: lockSerialNumber ? 1 : 0.6,
-                    pointerEvents: lockSerialNumber ? 'auto' : 'none'
-                  }}
-                >
-                  Submit
-                </button>
               </div>
             </div>
           </div>
